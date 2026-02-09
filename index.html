@@ -1,0 +1,1229 @@
+<!DOCTYPE html>
+<!--
+  Nested Wheel of Randomness
+  ══════════════════════════
+
+  A concentric two-wheel spinner for choosing restaurants. The outer ring holds
+  food genres, the inner ring holds restaurants for the selected genre. Clicking
+  the wheel spins the outer ring first, then auto-spins the inner ring.
+
+  ARCHITECTURE
+  ────────────
+  Single self-contained file: HTML + CSS (<style>) + JS (<script>).
+  No build step, no dependencies, no framework. Works on file:// and static hosts.
+  Target browsers: Chrome and Firefox (no Safari support needed).
+
+  DATA
+  ────
+  All state persisted in localStorage under key "wheel-of-randomness".
+  Schema: { version: 1, genres: [{ id, name, enabled, restaurants: [{ id, name, enabled }] }] }
+  IDs are 12-char hex strings from crypto.getRandomValues (works on file://).
+  Both genres and restaurants have an `enabled` flag for soft-disable.
+
+  SCREENS
+  ───────
+  Two screens toggled via .screen.active class:
+    1. Wheel screen — the SVG spinner, fills the viewport (designed for 4K TV display)
+    2. Config screen — accordion-style editor for genres/restaurants
+  Plus a fixed-position result overlay shown after a spin completes.
+
+  SVG GEOMETRY
+  ────────────
+  ViewBox: "-300 -300 600 600", origin at center.
+  Dynamic layout with two modes:
+    Single-ring (initial): genre wheel at radii 50–280, white core circle at r=50
+    Two-ring (after outer spin lands):
+      Genre ring shrinks to 175–280 (105px thick)
+      Restaurant ring appears at 30–160 (130px thick)
+      Gap between rings: 160–175 (15px)
+  Pointers: fixed white triangle at top for outer wheel (y ≈ -290), plus an
+  inner pointer at the ring boundary (y ≈ -167) shown only in two-ring mode.
+
+  The transition between modes is animated via rAF loop re-rendering paths at
+  interpolated radii (~600ms, ease-out). The genre ring's rotation is preserved
+  during the resize — only path geometry changes, not the <g> transform.
+
+  Container sizes to min(98vw, 98vh) with no max-width cap — designed to fill
+  a 4K TV viewport.
+
+  Coordinate system: 0 degrees = 12 o'clock (top). Angles increase clockwise.
+  polarToCart offsets by -90° so 0° maps to (0, -r) i.e. straight up.
+
+  SPIN MECHANICS
+  ──────────────
+  Uses requestAnimationFrame loop (not WAAPI) for full control over the easing curve.
+
+  Easing function: progress = 1 - (1 - t^a)^b
+    - `a` (1.2–1.5): controls ramp-up steepness. Low a = fast ramp to peak speed.
+    - `b` (3.0–4.5): controls deceleration tail length. Higher = longer slowdown.
+    - Velocity: v(t) = a*b * t^(a-1) * (1-t^a)^(b-1)
+      Always positive, single peak, smoothly approaches zero. No stitching, no
+      velocity floor — models physical friction on a spinning wheel.
+    - Peak velocity at t = ((a-1)/(a*b-1))^(1/a), typically ~8-12% into the animation.
+      This means ~88-92% of the spin duration is deceleration.
+
+  IMPORTANT tuning history (so you don't repeat these mistakes):
+    - a=1.8-2.6 was too slow to ramp up (peak at 25-35% of duration)
+    - b=5-9 made the tail imperceptibly slow for seconds (stall effect)
+    - A velocity floor (min speed clamp) was tried and rejected — it creates a
+      constant-speed cruise phase then a hard jolt to zero. Unphysical.
+    - Piecewise easing (cubic ramp + linear cruise + cubic decel) was tried and
+      rejected — the stitching points create visible kinks in the velocity.
+    - The single formula 1-(1-t^a)^b is the correct approach. It's smooth
+      everywhere, monotonically increasing, and the parameters have intuitive
+      physical meaning.
+
+  Landing position drama: 30% of spins land near the leading edge of a slice
+  (looks like it almost crossed over), 30% near the trailing edge (barely made
+  it in), 40% in the middle. This creates "will it make it?!" tension purely
+  through position, not easing tricks that would require re-acceleration.
+
+  Per-spin randomization: duration (5-8s), a (1.2-1.5), b (3.0-4.5), full
+  rotations (3-5), landing jitter. No two spins feel identical.
+
+  Minimum 3 seconds of deceleration is enforced via: minDuration = 3000 / (1 - peakT).
+
+  AUDIO
+  ─────
+  Web Audio API. AudioContext created on first user interaction (Chrome autoplay policy).
+    - Tick: 1200Hz square wave, 30ms, exponential gain decay. Fires on slice
+      boundary crossings detected in the rAF loop (no getComputedStyle parsing).
+    - Celebrate: ascending sine tones C5→E5→G5→C6, 120ms apart, on result.
+
+  STATE MACHINE
+  ─────────────
+  States: IDLE, OUTER_SPINNING, OUTER_LANDED, INNER_SPINNING, RESULT, CONFIG
+  Transitions enforced in Machine.transition(action). Clicks are suppressed
+  during spins via state check (not boolean flags).
+
+  Flow: IDLE → OUTER_SPINNING → OUTER_LANDED → (600ms) → INNER_SPINNING → RESULT
+  From RESULT: "Spin Again" resets to IDLE and auto-spins.
+               "Different Restaurant" re-spins inner only (same genre).
+               "Close" dismisses overlay back to IDLE.
+  IDLE ↔ CONFIG via gear button / back button.
+
+  CONFIG SCREEN
+  ─────────────
+  Accordion-style genre/restaurant tree. Event delegation on the genre-list
+  container with data-action attributes on interactive elements.
+  Inline rename via <input> elements (change event commits).
+  Auto-saves to localStorage on every interaction.
+  Genre count badge shows enabled/total restaurants.
+
+  EDGE CASES
+  ──────────
+  - Zero enabled genres: wheel hidden, CTA shown to configure
+  - Genre with zero enabled restaurants: result shows error message, "Different
+    Restaurant" button hidden
+  - Single item in ring: full annulus path (two semicircles, fill-rule: evenodd)
+    because SVG can't draw a full circle as a single arc
+  - transform-origin on SVG <g>: must be 0 0 (absolute), not 50% 50%
+  - Colors: golden angle hue distribution hsl(i * 137.508 % 360, 65%, 55%)
+    for maximum perceptual separation regardless of item count
+  - Text labels: rotated to align with slice, flipped 180° in bottom half for
+    readability, truncated with ellipsis based on ring dimensions, black stroke
+    outline (paint-order: stroke fill) for contrast on colored backgrounds
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wheel of Randomness</title>
+<style>
+/*
+ * CSS STRUCTURE
+ * - :root variables define the dark theme palette
+ * - Screen routing: .screen.active toggles visibility
+ * - Wheel screen: full-viewport, header overlaid absolutely
+ * - Config screen: scrollable, max-width 600px centered
+ * - Result overlay: fixed, backdrop-blur, z-index 100
+ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #1a1a2e;
+  --bg-surface: #16213e;
+  --bg-hover: #1f3460;
+  --text: #e0e0e0;
+  --text-muted: #8888aa;
+  --accent: #e94560;
+  --accent-hover: #ff6b81;
+  --border: #2a2a4a;
+  --success: #4ecdc4;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* --- Screen routing --- */
+.screen { display: none; flex-direction: column; width: 100%; height: 100vh; }
+.screen.active { display: flex; }
+
+/* --- Header --- */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 12px 24px;
+}
+#wheel-screen header {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 20;
+}
+header h1 { font-size: 1.4rem; font-weight: 600; }
+header button {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s;
+}
+header button:hover { background: var(--bg-hover); }
+
+/* --- Wheel screen --- */
+#wheel-screen {
+  position: relative;
+  align-items: center;
+  justify-content: center;
+}
+.wheel-container {
+  position: relative;
+  width: min(98vw, 98vh);
+  height: min(98vw, 98vh);
+}
+.wheel-container svg { width: 100%; height: 100%; }
+
+.wheel-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--text-muted);
+}
+.wheel-empty p { font-size: 1.1rem; }
+.wheel-empty button {
+  background: var(--accent);
+  border: none;
+  color: white;
+  padding: 12px 24px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 1rem;
+  transition: background 0.15s;
+}
+.wheel-empty button:hover { background: var(--accent-hover); }
+
+.spin-hint {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.spin-hint.visible { opacity: 1; }
+
+/* --- Pointer --- */
+.pointer {
+  fill: white;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
+}
+.inner-pointer {
+  transition: opacity 0.3s ease;
+}
+
+/* --- Wheel slices --- */
+.slice-path { cursor: pointer; stroke: rgba(255,255,255,0.08); stroke-width: 2; }
+.slice-path:hover { filter: brightness(1.15); }
+.slice-text { fill: white; font-weight: 600; pointer-events: none; text-anchor: middle; dominant-baseline: central; stroke: black; stroke-width: 3px; paint-order: stroke fill; stroke-linejoin: round; }
+
+/* --- Result overlay --- */
+#result-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.75);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+}
+#result-overlay.active { display: flex; }
+.result-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 40px 48px;
+  text-align: center;
+  max-width: 480px;
+  animation: popIn 0.3s ease-out;
+}
+@keyframes popIn {
+  from { transform: scale(0.8); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.result-card h2 { font-size: 1.1rem; color: var(--text-muted); margin-bottom: 12px; }
+.result-card .result-genre { font-size: 1.3rem; color: var(--accent); margin-bottom: 4px; }
+.result-card .result-arrow { font-size: 1.5rem; color: var(--text-muted); margin-bottom: 4px; }
+.result-card .result-restaurant { font-size: 2rem; font-weight: 700; margin-bottom: 24px; }
+.result-buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.result-buttons button {
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  font-size: 0.95rem;
+  transition: background 0.15s;
+}
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-secondary { background: var(--bg-hover); color: var(--text); border: 1px solid var(--border) !important; }
+.btn-secondary:hover { background: var(--border); }
+
+/* --- Config screen --- */
+#config-screen { padding-bottom: 40px; overflow-y: auto; }
+.config-container {
+  width: 100%;
+  max-width: 600px;
+  padding: 20px 24px;
+}
+.config-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.config-actions button {
+  background: var(--accent);
+  border: none;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: background 0.15s;
+}
+.config-actions button:hover { background: var(--accent-hover); }
+
+.genre-list { display: flex; flex-direction: column; gap: 8px; }
+
+.genre-item {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.genre-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  cursor: pointer;
+  user-select: none;
+}
+.genre-header:hover { background: var(--bg-hover); }
+.genre-arrow {
+  transition: transform 0.2s;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+.genre-item.expanded .genre-arrow { transform: rotate(90deg); }
+.genre-header input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+.genre-name {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 1rem;
+  padding: 2px 4px;
+  border-radius: 4px;
+  outline: none;
+  min-width: 0;
+}
+.genre-name:focus { background: var(--bg-hover); }
+.genre-count {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+.btn-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 0 4px;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+.btn-remove:hover { color: var(--accent); }
+
+.restaurant-list {
+  display: none;
+  padding: 0 16px 12px 44px;
+  flex-direction: column;
+  gap: 6px;
+}
+.genre-item.expanded .restaurant-list { display: flex; }
+.restaurant-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.restaurant-row input[type="checkbox"] {
+  accent-color: var(--success);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.restaurant-name {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 0.9rem;
+  padding: 2px 4px;
+  border-radius: 4px;
+  outline: none;
+  min-width: 0;
+}
+.restaurant-name:focus { background: var(--bg-hover); }
+.add-restaurant-btn {
+  background: none;
+  border: 1px dashed var(--border);
+  color: var(--text-muted);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.15s;
+  margin-top: 4px;
+}
+.add-restaurant-btn:hover { border-color: var(--text-muted); color: var(--text); }
+
+.config-empty {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 40px 0;
+}
+
+/* Disable interaction during spin */
+.spinning .slice-path { cursor: default; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<!-- Wheel Screen -->
+<div id="wheel-screen" class="screen active">
+  <header>
+    <h1>Wheel of Randomness</h1>
+    <button id="btn-to-config">Configure</button>
+  </header>
+  <div class="wheel-container" id="wheel-container">
+    <svg viewBox="-300 -300 600 600" id="wheel-svg">
+      <circle id="core-circle" cx="0" cy="0" r="50" fill="#ffffff" opacity="0.12" />
+      <g id="outer-wheel" style="transform-origin: 0px 0px;"></g>
+      <g id="inner-wheel" style="transform-origin: 0px 0px;"></g>
+      <!-- Pointer at top (outer wheel) -->
+      <polygon class="pointer" points="-12,-290 12,-290 0,-270" />
+      <!-- Pointer at inner ring boundary (inner wheel ticker) -->
+      <polygon class="pointer inner-pointer" points="-10,-175 10,-175 0,-157" style="display:none;" />
+    </svg>
+  </div>
+  <div class="wheel-empty" id="wheel-empty" style="display:none">
+    <p>No genres configured yet.</p>
+    <button id="btn-empty-config">Add Genres &amp; Restaurants</button>
+  </div>
+  <p class="spin-hint" id="spin-hint">Click the wheel to spin!</p>
+</div>
+
+<!-- Config Screen -->
+<div id="config-screen" class="screen">
+  <header>
+    <h1>Configure</h1>
+    <button id="btn-to-wheel">Back to Wheel</button>
+  </header>
+  <div class="config-container">
+    <div class="config-actions">
+      <button id="btn-add-genre">+ Add Genre</button>
+    </div>
+    <div class="genre-list" id="genre-list"></div>
+    <div class="config-empty" id="config-empty" style="display:none">
+      <p>No genres yet. Click "Add Genre" to get started.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Result Overlay -->
+<div id="result-overlay">
+  <div class="result-card">
+    <h2>Tonight's Pick</h2>
+    <div class="result-genre" id="result-genre"></div>
+    <div class="result-arrow">&#x2193;</div>
+    <div class="result-restaurant" id="result-restaurant"></div>
+    <div class="result-buttons">
+      <button class="btn-primary" id="btn-spin-again">Spin Again</button>
+      <button class="btn-secondary" id="btn-diff-restaurant">Different Restaurant</button>
+      <button class="btn-secondary" id="btn-dismiss">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════
+// Store — localStorage persistence layer
+// ═══════════════════════════════════════════════════════════════════════
+// In-memory cache (_data) avoids repeated JSON.parse on every access.
+// save() writes the entire state on every mutation — simple, no debounce needed.
+// activeGenres() / activeRestaurants() filter by enabled flag for wheel rendering.
+// IDs are 12-char hex from crypto.getRandomValues (works on file://).
+const Store = {
+  KEY: 'wheel-of-randomness',
+  _data: null,
+
+  _defaults() {
+    return { version: 1, genres: [] };
+  },
+
+  _genId() {
+    const arr = new Uint8Array(6);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+  },
+
+  load() {
+    if (this._data) return this._data;
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (raw) {
+        this._data = JSON.parse(raw);
+        return this._data;
+      }
+    } catch (e) { /* corrupt data, reset */ }
+    this._data = this._defaults();
+    return this._data;
+  },
+
+  save() {
+    try {
+      localStorage.setItem(this.KEY, JSON.stringify(this._data));
+    } catch (e) {
+      console.error('Failed to save:', e);
+    }
+  },
+
+  activeGenres() {
+    return this.load().genres.filter(g => g.enabled);
+  },
+
+  activeRestaurants(genreId) {
+    const genre = this.load().genres.find(g => g.id === genreId);
+    if (!genre) return [];
+    return genre.restaurants.filter(r => r.enabled);
+  },
+
+  addGenre(name) {
+    const g = { id: this._genId(), name, enabled: true, restaurants: [] };
+    this.load().genres.push(g);
+    this.save();
+    return g;
+  },
+
+  removeGenre(id) {
+    const d = this.load();
+    d.genres = d.genres.filter(g => g.id !== id);
+    this.save();
+  },
+
+  updateGenre(id, patch) {
+    const g = this.load().genres.find(g => g.id === id);
+    if (g) Object.assign(g, patch);
+    this.save();
+  },
+
+  addRestaurant(genreId, name) {
+    const genre = this.load().genres.find(g => g.id === genreId);
+    if (!genre) return null;
+    const r = { id: this._genId(), name, enabled: true };
+    genre.restaurants.push(r);
+    this.save();
+    return r;
+  },
+
+  removeRestaurant(genreId, restId) {
+    const genre = this.load().genres.find(g => g.id === genreId);
+    if (!genre) return;
+    genre.restaurants = genre.restaurants.filter(r => r.id !== restId);
+    this.save();
+  },
+
+  updateRestaurant(genreId, restId, patch) {
+    const genre = this.load().genres.find(g => g.id === genreId);
+    if (!genre) return;
+    const r = genre.restaurants.find(r => r.id === restId);
+    if (r) Object.assign(r, patch);
+    this.save();
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio Engine — Web Audio API sound effects
+// ═══════════════════════════════════════════════════════════════════════
+// AudioContext lazily created on first use (Chrome requires user gesture).
+// tick(): 1200Hz square wave, 30ms burst — fires on slice boundary crossings.
+// celebrate(): ascending sine sequence C5→E5→G5→C6 — fires on result.
+const Audio = {
+  _ctx: null,
+
+  _ensureCtx() {
+    if (!this._ctx) this._ctx = new AudioContext();
+    if (this._ctx.state === 'suspended') this._ctx.resume();
+    return this._ctx;
+  },
+
+  tick() {
+    const ctx = this._ensureCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = 1200;
+    gain.gain.setValueAtTime(0.08, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.03);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.03);
+  },
+
+  celebrate() {
+    const ctx = this._ensureCtx();
+    const freqs = [523.25, 659.25, 783.99, 1046.50];
+    freqs.forEach((f, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const t = ctx.currentTime + i * 0.12;
+      gain.gain.setValueAtTime(0.12, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.25);
+    });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Wheel Renderer — SVG generation for the concentric rings
+// ═══════════════════════════════════════════════════════════════════════
+// Each ring is a <g> element containing <path> (slice) + <text> (label) pairs.
+// The two <g> elements are independently rotatable via CSS transform.
+//
+// Radii are defined in the Layout object (single-ring and two-ring modes).
+// See Layout.single, Layout.outer, Layout.inner for the specific values.
+//
+// Arc math: annular sector = outer arc (CW) + line + inner arc (CCW) + close.
+// Single-item special case: full annulus via two semicircular arcs + evenodd fill.
+// Colors: golden angle hue spacing for perceptual separation.
+// Layout radii for single-ring (genre only) and two-ring (genre + restaurant) modes.
+// In single-ring mode the genre wheel fills most of the SVG with a small white core.
+// After the outer spin lands, it shrinks to make room for the restaurant ring.
+const Layout = {
+  single: { innerR: 50, outerR: 280 },   // genre wheel, full size
+  outer:  { innerR: 175, outerR: 280 },   // genre wheel, shrunk (two-ring mode)
+  inner:  { innerR: 30, outerR: 160 },    // restaurant wheel (two-ring mode)
+};
+const DEG = Math.PI / 180;
+
+function polarToCart(r, angleDeg) {
+  const rad = (angleDeg - 90) * DEG;
+  return { x: r * Math.cos(rad), y: r * Math.sin(rad) };
+}
+
+function arcPath(startAngle, endAngle, innerR, outerR) {
+  const sweep = endAngle - startAngle;
+  const largeArc = sweep > 180 ? 1 : 0;
+  const os = polarToCart(outerR, startAngle);
+  const oe = polarToCart(outerR, endAngle);
+  const ie = polarToCart(innerR, endAngle);
+  const is_ = polarToCart(innerR, startAngle);
+  return [
+    `M ${os.x} ${os.y}`,
+    `A ${outerR} ${outerR} 0 ${largeArc} 1 ${oe.x} ${oe.y}`,
+    `L ${ie.x} ${ie.y}`,
+    `A ${innerR} ${innerR} 0 ${largeArc} 0 ${is_.x} ${is_.y}`,
+    'Z'
+  ].join(' ');
+}
+
+function fullAnnulusPath(innerR, outerR) {
+  // Two semicircles for a full annulus
+  return [
+    `M 0 ${-outerR}`,
+    `A ${outerR} ${outerR} 0 1 1 0 ${outerR}`,
+    `A ${outerR} ${outerR} 0 1 1 0 ${-outerR}`,
+    `M 0 ${-innerR}`,
+    `A ${innerR} ${innerR} 0 1 0 0 ${innerR}`,
+    `A ${innerR} ${innerR} 0 1 0 0 ${-innerR}`,
+    'Z'
+  ].join(' ');
+}
+
+function sliceColor(index) {
+  return `hsl(${(index * 137.508) % 360}, 85%, 58%)`;
+}
+
+function fontSize(count, innerR, outerR) {
+  const thickness = outerR - innerR;
+  const base = Math.min(16, thickness * 0.11);
+  if (count <= 4) return base;
+  if (count <= 8) return base * 0.85;
+  if (count <= 12) return base * 0.72;
+  return Math.max(base * 0.6, 7);
+}
+
+function renderRing(gEl, items, innerR, outerR) {
+  gEl.innerHTML = '';
+  if (items.length === 0) return;
+
+  const sliceAngle = 360 / items.length;
+  const midR = (innerR + outerR) / 2;
+  const fSize = fontSize(items.length, innerR, outerR);
+
+  items.forEach((item, i) => {
+    const startAngle = i * sliceAngle;
+    const endAngle = (i + 1) * sliceAngle;
+
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('class', 'slice-path');
+    path.setAttribute('fill', sliceColor(i));
+    path.dataset.id = item.id;
+    path.dataset.index = i;
+
+    if (items.length === 1) {
+      path.setAttribute('d', fullAnnulusPath(innerR, outerR));
+      path.setAttribute('fill-rule', 'evenodd');
+    } else {
+      path.setAttribute('d', arcPath(startAngle, endAngle, innerR, outerR));
+    }
+    gEl.appendChild(path);
+
+    // Text label
+    const midAngle = startAngle + sliceAngle / 2;
+    const pos = polarToCart(midR, midAngle);
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('class', 'slice-text');
+    text.setAttribute('x', pos.x);
+    text.setAttribute('y', pos.y);
+    text.setAttribute('font-size', fSize);
+
+    // Rotate text to align with slice; flip if in bottom half
+    let textRotation = midAngle;
+    if (midAngle > 90 && midAngle < 270) textRotation += 180;
+    text.setAttribute('transform', `rotate(${textRotation}, ${pos.x}, ${pos.y})`);
+
+    // Truncate long names
+    let label = item.name;
+    const maxChars = Math.max(6, Math.floor((outerR - innerR) / 8));
+    if (label.length > maxChars) label = label.slice(0, maxChars - 1) + '\u2026';
+    text.textContent = label;
+    gEl.appendChild(text);
+  });
+}
+
+function renderOuterWheel(layout = Layout.single) {
+  const genres = Store.activeGenres();
+  const outerG = document.getElementById('outer-wheel');
+  renderRing(outerG, genres, layout.innerR, layout.outerR);
+  // Sync core circle radius with the inner edge of the genre ring
+  const core = document.getElementById('core-circle');
+  if (core) core.setAttribute('r', layout.innerR);
+  return genres;
+}
+
+function renderInnerWheel(restaurants) {
+  const innerG = document.getElementById('inner-wheel');
+  renderRing(innerG, restaurants, Layout.inner.innerR, Layout.inner.outerR);
+}
+
+function clearInnerWheel() {
+  document.getElementById('inner-wheel').innerHTML = '';
+  document.querySelector('.inner-pointer').style.display = 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Spin Mechanics — rAF animation loop with parametric easing
+// ═══════════════════════════════════════════════════════════════════════
+// Winner is pre-computed via Math.random() — the animation is purely visual.
+// The easing function 1-(1-t^a)^b models physical friction:
+//   - Fast ramp-up (a ≈ 1.3): energy being added to the wheel
+//   - Long deceleration (b ≈ 3.5): friction gradually stopping it
+//   - Velocity is always positive and approaches zero smoothly — no jolt
+// See the file-level comment block for detailed tuning history.
+function pickWinner(items) {
+  const idx = Math.floor(Math.random() * items.length);
+  return { index: idx, item: items[idx] };
+}
+
+// Animate the outer ring between layout states (e.g. single → two-ring).
+// Re-renders the ring geometry at interpolated radii each frame via rAF.
+// The <g> element's rotation transform is preserved — only path shapes change.
+async function animateLayout(fromLayout, toLayout, duration = 600) {
+  const outerG = document.getElementById('outer-wheel');
+  const core = document.getElementById('core-circle');
+  const genres = Store.activeGenres();
+  const startTime = performance.now();
+
+  return new Promise(resolve => {
+    function frame(now) {
+      const t = Math.min((now - startTime) / duration, 1);
+      const p = 1 - Math.pow(1 - t, 2); // ease-out
+
+      const innerR = fromLayout.innerR + (toLayout.innerR - fromLayout.innerR) * p;
+      const outerR = fromLayout.outerR + (toLayout.outerR - fromLayout.outerR) * p;
+      renderRing(outerG, genres, innerR, outerR);
+
+      if (core) core.setAttribute('r', innerR);
+
+      if (t < 1) requestAnimationFrame(frame);
+      else resolve();
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+// Easing: progress = 1 - (1 - t^a)^b
+//
+// Models a physical spinning wheel: energy added (ramp-up via t^a),
+// then friction decelerates it (decay via (1-x)^b). Velocity is
+// always positive, peaks once, then smoothly decreases to zero.
+// No velocity floor — the wheel naturally comes to rest.
+function buildEasing(a, b) {
+  return function ease(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return 1 - Math.pow(1 - Math.pow(t, a), b);
+  };
+}
+
+async function spinWheel(gEl, items, sliceAngle, currentRotation) {
+  const winner = pickWinner(items);
+  const winnerCenter = winner.index * sliceAngle + sliceAngle / 2;
+  const fullSpins = 3 + Math.floor(Math.random() * 3); // 3-5 full rotations
+
+  // Where the pointer should land: near the center of the winner's slice
+  // Jitter within the slice, but bias toward edges sometimes for drama
+  const r = Math.random();
+  let jitter;
+  if (r < 0.3) {
+    // Land near the leading edge of the slice (looks like it almost ticked over)
+    jitter = sliceAngle * (0.35 + Math.random() * 0.12);
+  } else if (r < 0.6) {
+    // Land near the trailing edge (looks like it barely made it in)
+    jitter = sliceAngle * -(0.35 + Math.random() * 0.12);
+  } else {
+    // Land somewhere in the middle
+    jitter = (Math.random() - 0.5) * sliceAngle * 0.5;
+  }
+
+  const targetAngle = fullSpins * 360 + (360 - winnerCenter) + jitter;
+  const startAngle = currentRotation % 360;
+  const totalRotation = targetAngle - startAngle;
+
+  // Randomize curve shape each spin
+  const a = 1.2 + Math.random() * 0.3;          // ramp steepness: 1.2-1.5 (fast ramp-up)
+  const b = 3.0 + Math.random() * 1.5;          // tail length: 3.0-4.5 (smooth decel to zero)
+  const easeFn = buildEasing(a, b);
+
+  // Peak speed at t = ((a-1)/(a*b-1))^(1/a). Ensure at least 3s of deceleration.
+  const peakT = Math.pow((a - 1) / (a * b - 1), 1 / a);
+  const minDuration = 3000 / (1 - peakT);
+  const duration = Math.max(minDuration, 5000 + Math.random() * 3000);
+
+  return new Promise(resolve => {
+    const startTime = performance.now();
+    let lastSliceIndex = -1;
+
+    function frame(now) {
+      const elapsed = now - startTime;
+      const t = Math.min(elapsed / duration, 1);
+      const progress = easeFn(t);
+      const currentAngle = startAngle + totalRotation * progress;
+
+      gEl.style.transform = `rotate(${currentAngle}deg)`;
+
+      // Tick sound on slice boundary crossing
+      const normAngle = ((currentAngle % 360) + 360) % 360;
+      const currentSlice = Math.floor(normAngle / sliceAngle) % items.length;
+      if (currentSlice !== lastSliceIndex && lastSliceIndex !== -1) {
+        Audio.tick();
+      }
+      lastSliceIndex = currentSlice;
+
+      if (t < 1) {
+        requestAnimationFrame(frame);
+      } else {
+        const finalAngle = (startAngle + totalRotation) % 360;
+        gEl.style.transform = `rotate(${finalAngle}deg)`;
+        resolve({ winner, finalAngle });
+      }
+    }
+    requestAnimationFrame(frame);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// State Machine — controls spin flow and screen transitions
+// ═══════════════════════════════════════════════════════════════════════
+// States: IDLE | OUTER_SPINNING | OUTER_LANDED | INNER_SPINNING | RESULT | CONFIG
+//
+// IDLE → SPIN → OUTER_SPINNING → OUTER_LANDED → (600ms) → INNER_SPINNING → RESULT
+// RESULT → SPIN_AGAIN: resets to IDLE, then auto-triggers SPIN
+// RESULT → DIFF_RESTAURANT: re-spins inner wheel only (same genre)
+// RESULT → DISMISS: back to IDLE, clears inner wheel
+// IDLE ↔ CONFIG: toggle between wheel and config screens
+//
+// All user clicks are gated on state — impossible to trigger a spin during
+// another spin, or navigate to config during animation.
+const Machine = {
+  state: 'IDLE',
+  outerRotation: 0,
+  innerRotation: 0,
+  selectedGenre: null,
+  selectedRestaurant: null,
+
+  async transition(action) {
+    switch (this.state) {
+      case 'IDLE': {
+        if (action === 'SPIN') {
+          const genres = Store.activeGenres();
+          if (genres.length === 0) return;
+
+          this.state = 'OUTER_SPINNING';
+          document.getElementById('wheel-container').classList.add('spinning');
+          document.getElementById('spin-hint').classList.remove('visible');
+
+          const sliceAngle = 360 / genres.length;
+          const outerG = document.getElementById('outer-wheel');
+          const result = await spinWheel(outerG, genres, sliceAngle, this.outerRotation);
+          this.outerRotation = result.finalAngle;
+          this.selectedGenre = result.winner.item;
+
+          this.state = 'OUTER_LANDED';
+
+          // Populate inner wheel with restaurants
+          const restaurants = Store.activeRestaurants(this.selectedGenre.id);
+          if (restaurants.length === 0) {
+            this.state = 'RESULT';
+            this.selectedRestaurant = null;
+            showResult(this.selectedGenre.name, 'No restaurants configured!');
+            document.getElementById('wheel-container').classList.remove('spinning');
+            document.getElementById('btn-diff-restaurant').style.display = 'none';
+            return;
+          }
+
+          // Animate genre ring shrinking to make room for restaurant ring
+          await animateLayout(Layout.single, Layout.outer, 600);
+          document.querySelector('.inner-pointer').style.display = '';
+          renderInnerWheel(restaurants);
+
+          // Brief pause after layout transition, then spin inner
+          await delay(300);
+          this.state = 'INNER_SPINNING';
+          await this._spinInner(restaurants);
+        } else if (action === 'CONFIG') {
+          this.state = 'CONFIG';
+          showScreen('config');
+        }
+        break;
+      }
+
+      case 'RESULT': {
+        if (action === 'SPIN_AGAIN') {
+          hideResult();
+          clearInnerWheel();
+          // Collapse back to single-ring, then re-spin
+          await animateLayout(Layout.outer, Layout.single, 400);
+          renderOuterWheel(Layout.single);
+          this.state = 'IDLE';
+          await this.transition('SPIN');
+        } else if (action === 'DIFF_RESTAURANT') {
+          hideResult();
+          const restaurants = Store.activeRestaurants(this.selectedGenre.id);
+          if (restaurants.length <= 1) {
+            showResult(this.selectedGenre.name, restaurants.length === 0 ? 'No restaurants!' : restaurants[0].name);
+            return;
+          }
+          this.state = 'INNER_SPINNING';
+          await this._spinInner(restaurants);
+        } else if (action === 'DISMISS') {
+          hideResult();
+          clearInnerWheel();
+          // Collapse back to single-ring layout
+          await animateLayout(Layout.outer, Layout.single, 400);
+          renderOuterWheel(Layout.single);
+          document.getElementById('wheel-container').classList.remove('spinning');
+          this.state = 'IDLE';
+          this.outerRotation = 0;
+          this.innerRotation = 0;
+          document.getElementById('outer-wheel').style.transform = '';
+          document.getElementById('inner-wheel').style.transform = '';
+          document.getElementById('spin-hint').classList.add('visible');
+        }
+        break;
+      }
+
+      case 'CONFIG': {
+        if (action === 'WHEEL') {
+          this.state = 'IDLE';
+          this.outerRotation = 0;
+          this.innerRotation = 0;
+          document.getElementById('outer-wheel').style.transform = '';
+          document.getElementById('inner-wheel').style.transform = '';
+          renderOuterWheel();
+          clearInnerWheel();
+          showScreen('wheel');
+          updateWheelVisibility();
+        }
+        break;
+      }
+    }
+  },
+
+  async _spinInner(restaurants) {
+    const sliceAngle = 360 / restaurants.length;
+    const innerG = document.getElementById('inner-wheel');
+    const result = await spinWheel(innerG, restaurants, sliceAngle, this.innerRotation);
+    this.innerRotation = result.finalAngle;
+    this.selectedRestaurant = result.winner.item;
+
+    Audio.celebrate();
+    this.state = 'RESULT';
+    document.getElementById('btn-diff-restaurant').style.display = '';
+    showResult(this.selectedGenre.name, this.selectedRestaurant.name);
+    document.getElementById('wheel-container').classList.remove('spinning');
+  }
+};
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function showResult(genre, restaurant) {
+  document.getElementById('result-genre').textContent = genre;
+  document.getElementById('result-restaurant').textContent = restaurant;
+  document.getElementById('result-overlay').classList.add('active');
+}
+
+function hideResult() {
+  document.getElementById('result-overlay').classList.remove('active');
+}
+
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(`${name}-screen`).classList.add('active');
+}
+
+function updateWheelVisibility() {
+  const genres = Store.activeGenres();
+  const hasGenres = genres.length > 0;
+  document.getElementById('wheel-container').style.display = hasGenres ? '' : 'none';
+  document.getElementById('wheel-empty').style.display = hasGenres ? 'none' : 'flex';
+  document.getElementById('spin-hint').classList.toggle('visible', hasGenres);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Config Screen — renders and handles the genre/restaurant editor
+// ═══════════════════════════════════════════════════════════════════════
+// Accordion UI: genre headers expand/collapse to show restaurant lists.
+// Event delegation: single click listener on #genre-list routes actions
+// via data-action attributes on interactive elements.
+// Rename: <input> elements commit on 'change' event (blur or Enter key).
+// All mutations auto-save to localStorage immediately.
+function renderConfig() {
+  const data = Store.load();
+  const list = document.getElementById('genre-list');
+  const empty = document.getElementById('config-empty');
+
+  if (data.genres.length === 0) {
+    list.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  list.innerHTML = data.genres.map(genre => {
+    const enabledCount = genre.restaurants.filter(r => r.enabled).length;
+    const totalCount = genre.restaurants.length;
+    return `
+      <div class="genre-item" data-genre-id="${genre.id}">
+        <div class="genre-header">
+          <span class="genre-arrow">&#9654;</span>
+          <input type="checkbox" ${genre.enabled ? 'checked' : ''} data-action="toggle-genre">
+          <input class="genre-name" value="${escHtml(genre.name)}" data-action="rename-genre" spellcheck="false">
+          <span class="genre-count">${enabledCount}/${totalCount}</span>
+          <button class="btn-remove" data-action="remove-genre" title="Remove genre">&times;</button>
+        </div>
+        <div class="restaurant-list">
+          ${genre.restaurants.map(r => `
+            <div class="restaurant-row" data-rest-id="${r.id}">
+              <input type="checkbox" ${r.enabled ? 'checked' : ''} data-action="toggle-rest">
+              <input class="restaurant-name" value="${escHtml(r.name)}" data-action="rename-rest" spellcheck="false">
+              <button class="btn-remove" data-action="remove-rest" title="Remove">&times;</button>
+            </div>
+          `).join('')}
+          <button class="add-restaurant-btn" data-action="add-rest">+ Add Restaurant</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Config event delegation — single listener, data-action routing
+document.getElementById('genre-list').addEventListener('click', e => {
+  const target = e.target;
+  const action = target.dataset.action;
+  const genreEl = target.closest('.genre-item');
+  if (!genreEl) return;
+  const genreId = genreEl.dataset.genreId;
+
+  if (action === 'toggle-genre') {
+    Store.updateGenre(genreId, { enabled: target.checked });
+    renderConfig();
+  } else if (action === 'remove-genre') {
+    Store.removeGenre(genreId);
+    renderConfig();
+  } else if (action === 'add-rest') {
+    Store.addRestaurant(genreId, 'New Restaurant');
+    renderConfig();
+    // Ensure expanded
+    const newGenreEl = document.querySelector(`[data-genre-id="${genreId}"]`);
+    if (newGenreEl) newGenreEl.classList.add('expanded');
+    // Focus the last restaurant name input
+    const inputs = newGenreEl.querySelectorAll('.restaurant-name');
+    if (inputs.length) {
+      const last = inputs[inputs.length - 1];
+      last.focus();
+      last.select();
+    }
+  } else if (action === 'remove-rest') {
+    const restEl = target.closest('.restaurant-row');
+    if (!restEl) return;
+    Store.removeRestaurant(genreId, restEl.dataset.restId);
+    renderConfig();
+    // Keep genre expanded
+    const reRendered = document.querySelector(`[data-genre-id="${genreId}"]`);
+    if (reRendered) reRendered.classList.add('expanded');
+  } else if (action === 'toggle-rest') {
+    const restEl = target.closest('.restaurant-row');
+    if (!restEl) return;
+    Store.updateRestaurant(genreId, restEl.dataset.restId, { enabled: target.checked });
+    renderConfig();
+    const reRendered = document.querySelector(`[data-genre-id="${genreId}"]`);
+    if (reRendered) reRendered.classList.add('expanded');
+  } else if (target.closest('.genre-header') && !action) {
+    // Toggle expand/collapse
+    genreEl.classList.toggle('expanded');
+  }
+});
+
+// Rename handlers (blur to commit)
+document.getElementById('genre-list').addEventListener('change', e => {
+  const target = e.target;
+  const action = target.dataset.action;
+  const genreEl = target.closest('.genre-item');
+  if (!genreEl) return;
+  const genreId = genreEl.dataset.genreId;
+
+  if (action === 'rename-genre') {
+    const val = target.value.trim();
+    if (val) Store.updateGenre(genreId, { name: val });
+    else target.value = Store.load().genres.find(g => g.id === genreId)?.name || '';
+  } else if (action === 'rename-rest') {
+    const restEl = target.closest('.restaurant-row');
+    if (!restEl) return;
+    const val = target.value.trim();
+    if (val) Store.updateRestaurant(genreId, restEl.dataset.restId, { name: val });
+  }
+});
+
+// Enter key commits rename
+document.getElementById('genre-list').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.target.dataset.action === 'rename-genre' || e.target.dataset.action === 'rename-rest')) {
+    e.preventDefault();
+    e.target.blur();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Navigation & Event Bindings
+// ═══════════════════════════════════════════════════════════════════════
+document.getElementById('btn-to-config').addEventListener('click', () => {
+  if (Machine.state !== 'IDLE') return;
+  renderConfig();
+  Machine.transition('CONFIG');
+});
+
+document.getElementById('btn-to-wheel').addEventListener('click', () => {
+  Machine.transition('WHEEL');
+});
+
+document.getElementById('btn-empty-config').addEventListener('click', () => {
+  renderConfig();
+  Machine.transition('CONFIG');
+});
+
+document.getElementById('btn-add-genre').addEventListener('click', () => {
+  const g = Store.addGenre('New Genre');
+  renderConfig();
+  // Expand and focus
+  const el = document.querySelector(`[data-genre-id="${g.id}"]`);
+  if (el) {
+    el.classList.add('expanded');
+    const nameInput = el.querySelector('.genre-name');
+    if (nameInput) { nameInput.focus(); nameInput.select(); }
+  }
+});
+
+// Wheel click → spin
+document.getElementById('wheel-svg').addEventListener('click', e => {
+  if (Machine.state === 'IDLE' && e.target.closest('.slice-path')) {
+    Machine.transition('SPIN');
+  }
+});
+
+// Result overlay buttons
+document.getElementById('btn-spin-again').addEventListener('click', () => Machine.transition('SPIN_AGAIN'));
+document.getElementById('btn-diff-restaurant').addEventListener('click', () => Machine.transition('DIFF_RESTAURANT'));
+document.getElementById('btn-dismiss').addEventListener('click', () => Machine.transition('DISMISS'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Init — load data and render initial state
+// ═══════════════════════════════════════════════════════════════════════
+Store.load();
+renderOuterWheel();
+updateWheelVisibility();
+</script>
+</body>
+</html>
