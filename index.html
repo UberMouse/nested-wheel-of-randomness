@@ -16,7 +16,7 @@
   DATA
   ────
   All state persisted in localStorage under key "wheel-of-randomness".
-  Schema: { version: 1, genres: [{ id, name, enabled, restaurants: [{ id, name, enabled }] }] }
+  Schema: { version: 1, genres: [{ id, name, enabled, color, restaurants: [{ id, name, enabled, color }] }] }
   IDs are 12-char hex strings from crypto.getRandomValues (works on file://).
   Both genres and restaurants have an `enabled` flag for soft-disable.
 
@@ -118,8 +118,8 @@
   - Single item in ring: full annulus path (two semicircles, fill-rule: evenodd)
     because SVG can't draw a full circle as a single arc
   - transform-origin on SVG <g>: must be 0 0 (absolute), not 50% 50%
-  - Colors: golden angle hue distribution hsl(i * 137.508 % 360, 65%, 55%)
-    for maximum perceptual separation regardless of item count
+  - Colors: per-item custom color (hex) or auto via golden angle hue distribution
+    hsl(i * 137.508 % 360, 85%, 58%) for maximum perceptual separation
   - Text labels: rotated to align with slice, flipped 180° in bottom half for
     readability, truncated with ellipsis based on ring dimensions, black stroke
     outline (paint-order: stroke fill) for contrast on colored backgrounds
@@ -420,6 +420,34 @@ header button:hover { background: var(--bg-hover); }
   margin-top: 4px;
 }
 .add-restaurant-btn:hover { border-color: var(--text-muted); color: var(--text); }
+.color-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+}
+.color-swatch:hover { border-color: var(--text-muted); }
+.color-swatch input[type="color"] {
+  position: absolute;
+  opacity: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+.color-reset {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 2px;
+  flex-shrink: 0;
+  display: none;
+}
+.color-reset:hover { color: var(--accent); }
 
 .config-empty {
   text-align: center;
@@ -543,7 +571,7 @@ const Store = {
   },
 
   addGenre(name) {
-    const g = { id: this._genId(), name, enabled: true, restaurants: [] };
+    const g = { id: this._genId(), name, enabled: true, color: null, restaurants: [] };
     this.load().genres.push(g);
     this.save();
     return g;
@@ -564,7 +592,7 @@ const Store = {
   addRestaurant(genreId, name) {
     const genre = this.load().genres.find(g => g.id === genreId);
     if (!genre) return null;
-    const r = { id: this._genId(), name, enabled: true };
+    const r = { id: this._genId(), name, enabled: true, color: null };
     genre.restaurants.push(r);
     this.save();
     return r;
@@ -692,6 +720,10 @@ function sliceColor(index) {
   return `hsl(${(index * 137.508) % 360}, 85%, 58%)`;
 }
 
+function itemColor(item, index) {
+  return item.color || sliceColor(index);
+}
+
 function fontSize(count, innerR, outerR) {
   const thickness = outerR - innerR;
   const base = Math.min(16, thickness * 0.11);
@@ -715,7 +747,7 @@ function renderRing(gEl, items, innerR, outerR) {
 
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     path.setAttribute('class', 'slice-path');
-    path.setAttribute('fill', sliceColor(i));
+    path.setAttribute('fill', itemColor(item, i));
     path.dataset.id = item.id;
     path.dataset.index = i;
 
@@ -1069,26 +1101,39 @@ function renderConfig() {
   }
   empty.style.display = 'none';
 
-  list.innerHTML = data.genres.map(genre => {
+  list.innerHTML = data.genres.map((genre, gi) => {
     const enabledCount = genre.restaurants.filter(r => r.enabled).length;
     const totalCount = genre.restaurants.length;
+    const genreColor = genre.color || sliceColor(gi);
     return `
       <div class="genre-item" data-genre-id="${genre.id}">
         <div class="genre-header">
           <span class="genre-arrow">&#9654;</span>
           <input type="checkbox" ${genre.enabled ? 'checked' : ''} data-action="toggle-genre">
+          <div class="color-swatch" style="background:${genreColor}" data-action="color-genre">
+            <input type="color" value="${hslToHex(genreColor)}" data-action="pick-color-genre" tabindex="-1">
+          </div>
           <input class="genre-name" value="${escHtml(genre.name)}" data-action="rename-genre" spellcheck="false">
+          <button class="color-reset" data-action="reset-color-genre"
+            style="display:${genre.color ? 'inline' : 'none'}" title="Reset to auto color">&#8634;</button>
           <span class="genre-count">${enabledCount}/${totalCount}</span>
           <button class="btn-remove" data-action="remove-genre" title="Remove genre">&times;</button>
         </div>
         <div class="restaurant-list">
-          ${genre.restaurants.map(r => `
+          ${genre.restaurants.map((r, ri) => {
+            const restColor = r.color || sliceColor(ri);
+            return `
             <div class="restaurant-row" data-rest-id="${r.id}">
               <input type="checkbox" ${r.enabled ? 'checked' : ''} data-action="toggle-rest">
+              <div class="color-swatch" style="background:${restColor}" data-action="color-rest">
+                <input type="color" value="${hslToHex(restColor)}" data-action="pick-color-rest" tabindex="-1">
+              </div>
               <input class="restaurant-name" value="${escHtml(r.name)}" data-action="rename-rest" spellcheck="false">
+              <button class="color-reset" data-action="reset-color-rest"
+                style="display:${r.color ? 'inline' : 'none'}" title="Reset to auto color">&#8634;</button>
               <button class="btn-remove" data-action="remove-rest" title="Remove">&times;</button>
             </div>
-          `).join('')}
+          `}).join('')}
           <button class="add-restaurant-btn" data-action="add-rest">+ Add Restaurant</button>
         </div>
       </div>
@@ -1098,6 +1143,19 @@ function renderConfig() {
 
 function escHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function hslToHex(color) {
+  if (color.startsWith('#')) return color;
+  // Parse hsl(h, s%, l%) and convert to hex via a temp element
+  const el = document.createElement('div');
+  el.style.color = color;
+  document.body.appendChild(el);
+  const computed = getComputedStyle(el).color;
+  document.body.removeChild(el);
+  const m = computed.match(/\d+/g);
+  if (!m) return '#888888';
+  return '#' + m.slice(0, 3).map(v => parseInt(v).toString(16).padStart(2, '0')).join('');
 }
 
 // Config event delegation — single listener, data-action routing
@@ -1142,6 +1200,16 @@ document.getElementById('genre-list').addEventListener('click', e => {
     renderConfig();
     const reRendered = document.querySelector(`[data-genre-id="${genreId}"]`);
     if (reRendered) reRendered.classList.add('expanded');
+  } else if (action === 'reset-color-genre') {
+    Store.updateGenre(genreId, { color: null });
+    renderConfig();
+  } else if (action === 'reset-color-rest') {
+    const restEl = target.closest('.restaurant-row');
+    if (!restEl) return;
+    Store.updateRestaurant(genreId, restEl.dataset.restId, { color: null });
+    renderConfig();
+    const reRendered = document.querySelector(`[data-genre-id="${genreId}"]`);
+    if (reRendered) reRendered.classList.add('expanded');
   } else if (target.closest('.genre-header') && !action) {
     // Toggle expand/collapse
     genreEl.classList.toggle('expanded');
@@ -1165,6 +1233,26 @@ document.getElementById('genre-list').addEventListener('change', e => {
     if (!restEl) return;
     const val = target.value.trim();
     if (val) Store.updateRestaurant(genreId, restEl.dataset.restId, { name: val });
+  } else if (action === 'pick-color-genre') {
+    Store.updateGenre(genreId, { color: target.value });
+    renderConfig();
+  } else if (action === 'pick-color-rest') {
+    const restEl = target.closest('.restaurant-row');
+    if (!restEl) return;
+    Store.updateRestaurant(genreId, restEl.dataset.restId, { color: target.value });
+    renderConfig();
+    const reRendered = document.querySelector(`[data-genre-id="${genreId}"]`);
+    if (reRendered) reRendered.classList.add('expanded');
+  }
+});
+
+// Live color preview via input event (fires as user drags in color picker)
+document.getElementById('genre-list').addEventListener('input', e => {
+  const target = e.target;
+  const action = target.dataset.action;
+  if (action === 'pick-color-genre' || action === 'pick-color-rest') {
+    const swatch = target.closest('.color-swatch');
+    if (swatch) swatch.style.background = target.value;
   }
 });
 
