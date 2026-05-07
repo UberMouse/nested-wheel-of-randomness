@@ -811,9 +811,15 @@ function clearInnerWheel() {
 //   - Long deceleration (b ≈ 3.5): friction gradually stopping it
 //   - Velocity is always positive and approaches zero smoothly — no jolt
 // See the file-level comment block for detailed tuning history.
-function pickWinner(items) {
-  const idx = Math.floor(Math.random() * items.length);
-  return { index: idx, item: items[idx] };
+function pickWinner(items, excludeId = null) {
+  let candidates = items;
+  if (excludeId) {
+    candidates = items.filter(item => item.id !== excludeId);
+  }
+  if (candidates.length === 0) candidates = items;
+  const candidate = candidates[Math.floor(Math.random() * candidates.length)];
+  const idx = items.findIndex(item => item.id === candidate.id);
+  return { index: idx, item: candidate };
 }
 
 // Animate the outer ring between layout states (e.g. single → two-ring).
@@ -857,8 +863,8 @@ function buildEasing(a, b) {
   };
 }
 
-async function spinWheel(gEl, items, sliceAngle, currentRotation) {
-  const winner = pickWinner(items);
+async function spinWheel(gEl, items, sliceAngle, currentRotation, excludeId = null) {
+  const winner = pickWinner(items, excludeId);
   const winnerCenter = winner.index * sliceAngle + sliceAngle / 2;
   const fullSpins = 3 + Math.floor(Math.random() * 3); // 3-5 full rotations
 
@@ -943,7 +949,7 @@ const Machine = {
   selectedGenre: null,
   selectedRestaurant: null,
 
-  async transition(action) {
+  async transition(action, { excludeGenreId, excludeRestaurantId } = {}) {
     switch (this.state) {
       case 'IDLE': {
         if (action === 'SPIN') {
@@ -956,7 +962,7 @@ const Machine = {
 
           const sliceAngle = 360 / genres.length;
           const outerG = document.getElementById('outer-wheel');
-          const result = await spinWheel(outerG, genres, sliceAngle, this.outerRotation);
+          const result = await spinWheel(outerG, genres, sliceAngle, this.outerRotation, excludeGenreId);
           this.outerRotation = result.finalAngle;
           this.selectedGenre = result.winner.item;
 
@@ -991,14 +997,16 @@ const Machine = {
 
       case 'RESULT': {
         if (action === 'SPIN_AGAIN') {
+          const prevGenreId = this.selectedGenre?.id;
           hideResult();
           clearInnerWheel();
           // Collapse back to single-ring, then re-spin
           await animateLayout(Layout.outer, Layout.single, 400);
           renderOuterWheel(Layout.single);
           this.state = 'IDLE';
-          await this.transition('SPIN');
+          await this.transition('SPIN', { excludeGenreId: prevGenreId });
         } else if (action === 'DIFF_RESTAURANT') {
+          const prevRestaurantId = this.selectedRestaurant?.id;
           hideResult();
           const restaurants = Store.activeRestaurants(this.selectedGenre.id);
           if (restaurants.length <= 1) {
@@ -1006,7 +1014,7 @@ const Machine = {
             return;
           }
           this.state = 'INNER_SPINNING';
-          await this._spinInner(restaurants);
+          await this._spinInner(restaurants, prevRestaurantId);
         } else if (action === 'DISMISS') {
           hideResult();
           clearInnerWheel();
@@ -1041,10 +1049,10 @@ const Machine = {
     }
   },
 
-  async _spinInner(restaurants) {
+  async _spinInner(restaurants, excludeId = null) {
     const sliceAngle = 360 / restaurants.length;
     const innerG = document.getElementById('inner-wheel');
-    const result = await spinWheel(innerG, restaurants, sliceAngle, this.innerRotation);
+    const result = await spinWheel(innerG, restaurants, sliceAngle, this.innerRotation, excludeId);
     this.innerRotation = result.finalAngle;
     this.selectedRestaurant = result.winner.item;
 
