@@ -199,8 +199,9 @@ header button:hover { background: var(--bg-hover); }
 }
 .wheel-container {
   position: relative;
-  width: min(98vw, 98vh);
-  height: min(98vw, 98vh);
+  width: min(95vw, calc(95vh - 100px));
+  height: min(95vw, calc(95vh - 100px));
+  margin-top: 50px;
 }
 .wheel-container svg { width: 100%; height: 100%; }
 
@@ -237,6 +238,18 @@ header button:hover { background: var(--bg-hover); }
 }
 .spin-hint.visible { opacity: 1; }
 
+.wheel-progress {
+  position: absolute;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.wheel-progress.visible { opacity: 1; }
+
 /* --- Pointer --- */
 .pointer {
   fill: white;
@@ -250,6 +263,37 @@ header button:hover { background: var(--bg-hover); }
 .slice-path { cursor: pointer; stroke: rgba(255,255,255,0.08); stroke-width: 2; }
 .slice-path:hover { filter: brightness(1.15); }
 .slice-text { fill: white; font-weight: 600; pointer-events: none; text-anchor: middle; dominant-baseline: central; stroke: black; stroke-width: 3px; paint-order: stroke fill; stroke-linejoin: round; }
+
+/* --- Visited restaurant slices (dimmed with strikethrough) --- */
+#inner-wheel .slice-group.visited .slice-path { opacity: 0.35; }
+#inner-wheel .slice-group.visited .slice-text { opacity: 0.45; text-decoration: line-through; }
+
+/* --- Notification toast --- */
+.notification {
+  position: fixed;
+  top: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--success);
+  color: #1a1a2e;
+  padding: 12px 24px;
+  border-radius: 8px;
+  font-weight: 600;
+  z-index: 200;
+  animation: slideIn 0.3s ease-out;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.notification.fade-out {
+  animation: slideOut 0.3s ease-in forwards;
+}
+@keyframes slideIn {
+  from { transform: translateX(-50%) translateY(-20px); opacity: 0; }
+  to { transform: translateX(-50%) translateY(0); opacity: 1; }
+}
+@keyframes slideOut {
+  from { transform: translateX(-50%) translateY(0); opacity: 1; }
+  to { transform: translateX(-50%) translateY(-20px); opacity: 0; }
+}
 
 /* --- Result overlay --- */
 #result-overlay {
@@ -455,6 +499,18 @@ header button:hover { background: var(--bg-hover); }
   padding: 40px 0;
 }
 
+.btn-reset {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: all 0.15s;
+}
+.btn-reset:hover { background: var(--accent); color: white; }
+
 /* Disable interaction during spin */
 .spinning .slice-path { cursor: default; pointer-events: none; }
 </style>
@@ -483,6 +539,7 @@ header button:hover { background: var(--bg-hover); }
     <button id="btn-empty-config">Add Genres &amp; Restaurants</button>
   </div>
   <p class="spin-hint" id="spin-hint">Click the wheel to spin!</p>
+  <p class="wheel-progress" id="wheel-progress"></p>
 </div>
 
 <!-- Config Screen -->
@@ -498,6 +555,13 @@ header button:hover { background: var(--bg-hover); }
     <div class="genre-list" id="genre-list"></div>
     <div class="config-empty" id="config-empty" style="display:none">
       <p>No genres yet. Click "Add Genre" to get started.</p>
+    </div>
+    <div class="progress-section" id="progress-section">
+      <hr style="border: none; border-top: 1px solid var(--border); margin: 24px 0;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <button id="btn-reset-progress" class="btn-reset">Reset Progress</button>
+        <span id="progress-count" style="color: var(--text-muted); font-size: 0.9rem;"></span>
+      </div>
     </div>
   </div>
 </div>
@@ -611,6 +675,92 @@ const Store = {
     const r = genre.restaurants.find(r => r.id === restId);
     if (r) Object.assign(r, patch);
     this.save();
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Visited Tracking — tracks restaurants that have been landed on
+// ═══════════════════════════════════════════════════════════════════════
+// Separate from Store to keep configuration separate from session state.
+// Restaurants are marked visited when the spin lands; unmarked if user
+// clicks "Spin Again" or "Different Restaurant" (giving it another chance).
+const Visited = {
+  KEY: 'wheel-of-randomness-visited',
+  _set: null,
+
+  _load() {
+    if (this._set) return this._set;
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (raw) {
+        const data = JSON.parse(raw);
+        this._set = new Set(data.restaurants || []);
+        return this._set;
+      }
+    } catch (e) { /* corrupt data, reset */ }
+    this._set = new Set();
+    return this._set;
+  },
+
+  _save() {
+    try {
+      localStorage.setItem(this.KEY, JSON.stringify({ restaurants: [...this._set] }));
+    } catch (e) {
+      console.error('Failed to save visited:', e);
+    }
+  },
+
+  isVisited(restaurantId) {
+    return this._load().has(restaurantId);
+  },
+
+  mark(restaurantId) {
+    this._load().add(restaurantId);
+    this._save();
+  },
+
+  unmark(restaurantId) {
+    this._load().delete(restaurantId);
+    this._save();
+  },
+
+  reset() {
+    this._set = new Set();
+    this._save();
+  },
+
+  // Check if all active restaurants in a genre have been visited
+  allVisitedForGenre(genreId) {
+    const restaurants = Store.activeRestaurants(genreId);
+    if (restaurants.length === 0) return false;
+    return restaurants.every(r => this.isVisited(r.id));
+  },
+
+  // Check if all active restaurants across all genres have been visited
+  allExhausted() {
+    const genres = Store.activeGenres();
+    if (genres.length === 0) return false;
+    for (const genre of genres) {
+      const restaurants = Store.activeRestaurants(genre.id);
+      for (const r of restaurants) {
+        if (!this.isVisited(r.id)) return false;
+      }
+    }
+    return true;
+  },
+
+  // Get count of visited vs total active restaurants
+  getProgress() {
+    const genres = Store.activeGenres();
+    let visited = 0, total = 0;
+    for (const genre of genres) {
+      const restaurants = Store.activeRestaurants(genre.id);
+      for (const r of restaurants) {
+        total++;
+        if (this.isVisited(r.id)) visited++;
+      }
+    }
+    return { visited, total };
   }
 };
 
@@ -733,7 +883,7 @@ function fontSize(count, innerR, outerR) {
   return Math.max(base * 0.6, 7);
 }
 
-function renderRing(gEl, items, innerR, outerR) {
+function renderRing(gEl, items, innerR, outerR, { checkVisited = false } = {}) {
   gEl.innerHTML = '';
   if (items.length === 0) return;
 
@@ -744,6 +894,10 @@ function renderRing(gEl, items, innerR, outerR) {
   items.forEach((item, i) => {
     const startAngle = i * sliceAngle;
     const endAngle = (i + 1) * sliceAngle;
+
+    // Wrap path and text in a group for visited styling
+    const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    group.setAttribute('class', 'slice-group' + (checkVisited && Visited.isVisited(item.id) ? ' visited' : ''));
 
     const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
     path.setAttribute('class', 'slice-path');
@@ -757,7 +911,7 @@ function renderRing(gEl, items, innerR, outerR) {
     } else {
       path.setAttribute('d', arcPath(startAngle, endAngle, innerR, outerR));
     }
-    gEl.appendChild(path);
+    group.appendChild(path);
 
     // Text label
     const midAngle = startAngle + sliceAngle / 2;
@@ -778,7 +932,9 @@ function renderRing(gEl, items, innerR, outerR) {
     const maxChars = Math.max(6, Math.floor((outerR - innerR) / 8));
     if (label.length > maxChars) label = label.slice(0, maxChars - 1) + '\u2026';
     text.textContent = label;
-    gEl.appendChild(text);
+    group.appendChild(text);
+
+    gEl.appendChild(group);
   });
 }
 
@@ -794,7 +950,7 @@ function renderOuterWheel(layout = Layout.single) {
 
 function renderInnerWheel(restaurants) {
   const innerG = document.getElementById('inner-wheel');
-  renderRing(innerG, restaurants, Layout.inner.innerR, Layout.inner.outerR);
+  renderRing(innerG, restaurants, Layout.inner.innerR, Layout.inner.outerR, { checkVisited: true });
 }
 
 function clearInnerWheel() {
@@ -811,10 +967,13 @@ function clearInnerWheel() {
 //   - Long deceleration (b ≈ 3.5): friction gradually stopping it
 //   - Velocity is always positive and approaches zero smoothly — no jolt
 // See the file-level comment block for detailed tuning history.
-function pickWinner(items, excludeId = null) {
+function pickWinner(items, excludeIds = null) {
   let candidates = items;
-  if (excludeId) {
-    candidates = items.filter(item => item.id !== excludeId);
+  if (excludeIds) {
+    // Support both single ID (string) and Set/Array of IDs
+    const excludeSet = excludeIds instanceof Set ? excludeIds :
+      (Array.isArray(excludeIds) ? new Set(excludeIds) : new Set([excludeIds]));
+    candidates = items.filter(item => !excludeSet.has(item.id));
   }
   if (candidates.length === 0) candidates = items;
   const candidate = candidates[Math.floor(Math.random() * candidates.length)];
@@ -930,6 +1089,24 @@ async function spinWheel(gEl, items, sliceAngle, currentRotation, excludeId = nu
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Notification — toast-style messages
+// ═══════════════════════════════════════════════════════════════════════
+function showNotification(message, duration = 2500) {
+  const existing = document.querySelector('.notification');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.className = 'notification';
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add('fade-out');
+    setTimeout(() => toast.remove(), 300);
+  }, duration);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // State Machine — controls spin flow and screen transitions
 // ═══════════════════════════════════════════════════════════════════════
 // States: IDLE | OUTER_SPINNING | OUTER_LANDED | INNER_SPINNING | RESULT | CONFIG
@@ -956,13 +1133,30 @@ const Machine = {
           const genres = Store.activeGenres();
           if (genres.length === 0) return;
 
+          // Check if all restaurants have been visited — auto-reset if so
+          if (Visited.allExhausted()) {
+            Visited.reset();
+            updateProgressCount();
+            showNotification('Starting fresh! All restaurants visited.');
+          }
+
           this.state = 'OUTER_SPINNING';
           document.getElementById('wheel-container').classList.add('spinning');
           document.getElementById('spin-hint').classList.remove('visible');
 
+          // Build exclude set: genres where all restaurants have been visited
+          const exhaustedGenreIds = new Set();
+          for (const g of genres) {
+            if (Visited.allVisitedForGenre(g.id)) {
+              exhaustedGenreIds.add(g.id);
+            }
+          }
+          // Also exclude the genre from the previous spin if passed
+          if (excludeGenreId) exhaustedGenreIds.add(excludeGenreId);
+
           const sliceAngle = 360 / genres.length;
           const outerG = document.getElementById('outer-wheel');
-          const result = await spinWheel(outerG, genres, sliceAngle, this.outerRotation, excludeGenreId);
+          const result = await spinWheel(outerG, genres, sliceAngle, this.outerRotation, exhaustedGenreIds);
           this.outerRotation = result.finalAngle;
           this.selectedGenre = result.winner.item;
 
@@ -998,6 +1192,11 @@ const Machine = {
       case 'RESULT': {
         if (action === 'SPIN_AGAIN') {
           const prevGenreId = this.selectedGenre?.id;
+          // Unmark the restaurant so it can come up again
+          if (this.selectedRestaurant) {
+            Visited.unmark(this.selectedRestaurant.id);
+            updateProgressCount();
+          }
           hideResult();
           clearInnerWheel();
           // Collapse back to single-ring, then re-spin
@@ -1007,8 +1206,15 @@ const Machine = {
           await this.transition('SPIN', { excludeGenreId: prevGenreId });
         } else if (action === 'DIFF_RESTAURANT') {
           const prevRestaurantId = this.selectedRestaurant?.id;
+          // Unmark the restaurant so it can come up again
+          if (this.selectedRestaurant) {
+            Visited.unmark(this.selectedRestaurant.id);
+          }
           hideResult();
           const restaurants = Store.activeRestaurants(this.selectedGenre.id);
+          // Re-render to show unmarked state before spinning
+          renderInnerWheel(restaurants);
+          updateProgressCount();
           if (restaurants.length <= 1) {
             showResult(this.selectedGenre.name, restaurants.length === 0 ? 'No restaurants!' : restaurants[0].name);
             return;
@@ -1050,11 +1256,25 @@ const Machine = {
   },
 
   async _spinInner(restaurants, excludeId = null) {
+    // Build exclude set: visited restaurants + the one just spun (if re-spinning)
+    const excludeIds = new Set();
+    for (const r of restaurants) {
+      if (Visited.isVisited(r.id)) excludeIds.add(r.id);
+    }
+    if (excludeId) excludeIds.add(excludeId);
+
     const sliceAngle = 360 / restaurants.length;
     const innerG = document.getElementById('inner-wheel');
-    const result = await spinWheel(innerG, restaurants, sliceAngle, this.innerRotation, excludeId);
+    const result = await spinWheel(innerG, restaurants, sliceAngle, this.innerRotation, excludeIds);
     this.innerRotation = result.finalAngle;
     this.selectedRestaurant = result.winner.item;
+
+    // Mark as visited immediately upon landing
+    Visited.mark(this.selectedRestaurant.id);
+
+    // Update inner wheel to show the newly visited restaurant as dimmed
+    renderInnerWheel(restaurants);
+    updateProgressCount();
 
     Audio.celebrate();
     this.state = 'RESULT';
@@ -1278,6 +1498,7 @@ document.getElementById('genre-list').addEventListener('keydown', e => {
 document.getElementById('btn-to-config').addEventListener('click', () => {
   if (Machine.state !== 'IDLE') return;
   renderConfig();
+  updateProgressCount();
   Machine.transition('CONFIG');
 });
 
@@ -1287,6 +1508,7 @@ document.getElementById('btn-to-wheel').addEventListener('click', () => {
 
 document.getElementById('btn-empty-config').addEventListener('click', () => {
   renderConfig();
+  updateProgressCount();
   Machine.transition('CONFIG');
 });
 
@@ -1301,6 +1523,35 @@ document.getElementById('btn-add-genre').addEventListener('click', () => {
     if (nameInput) { nameInput.focus(); nameInput.select(); }
   }
 });
+
+document.getElementById('btn-reset-progress').addEventListener('click', () => {
+  Visited.reset();
+  updateProgressCount();
+  showNotification('Progress reset!');
+});
+
+function updateProgressCount() {
+  const { visited, total } = Visited.getProgress();
+
+  // Config screen progress
+  const countEl = document.getElementById('progress-count');
+  const sectionEl = document.getElementById('progress-section');
+  if (total === 0) {
+    sectionEl.style.display = 'none';
+  } else {
+    sectionEl.style.display = '';
+    countEl.textContent = `${visited}/${total} visited`;
+  }
+
+  // Wheel screen progress
+  const wheelProgress = document.getElementById('wheel-progress');
+  if (total === 0 || visited === 0) {
+    wheelProgress.classList.remove('visible');
+  } else {
+    wheelProgress.textContent = `${visited}/${total} visited`;
+    wheelProgress.classList.add('visible');
+  }
+}
 
 // Wheel click → spin
 document.getElementById('wheel-svg').addEventListener('click', e => {
@@ -1318,8 +1569,10 @@ document.getElementById('btn-dismiss').addEventListener('click', () => Machine.t
 // Init — load data and render initial state
 // ═══════════════════════════════════════════════════════════════════════
 Store.load();
+Visited._load();
 renderOuterWheel();
 updateWheelVisibility();
+updateProgressCount();
 </script>
 </body>
 </html>
